@@ -1,0 +1,8 @@
+[package]
+name = "roci"
+version = "0.1.0"
+authors = ["Joshua Jones <joshua.jones.software@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+libc = "0.2.55"
