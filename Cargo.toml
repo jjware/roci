@@ -3,6 +3,11 @@ name = "roci"
 version = "0.1.0"
 authors = ["Joshua Jones <joshua.jones.software@gmail.com>"]
 edition = "2018"
+build = "build.rs"
 
 [dependencies]
 libc = "0.2.55"
+log = "0.4.6"
+
+[build-dependencies]
+pkg-config = "0.3.14"

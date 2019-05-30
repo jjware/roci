@@ -1,8 +1,11 @@
-use libc::{c_int, c_uint, c_void, size_t, c_uchar};
-use ::std::ptr;
+use libc::{c_int, c_uint, c_void, size_t, c_char};
+use std::ptr;
+use std::ffi::CString;
 
 const MAX_ERROR_MESSAGE_SIZE: usize = 3024;
 
+/*
+#[derive(Debug)]
 pub struct CString {
     data: Vec<c_uchar>
 }
@@ -31,9 +34,7 @@ impl From<CString> for String {
         String::from_utf8_lossy(&cstring.data[0..first_null_byte_index]).into_owned()
     }
 }
-
-#[repr(C)]
-pub struct Env { _private: [u8; 0] }
+*/
 
 const OCI_DEFAULT: c_uint = 0;
 const OCI_THREADED: c_uint = 1;
@@ -60,7 +61,7 @@ const OCI_NO_DATA: c_int = 100;
 const OCI_INVALID_HANDLE: c_int = -2;
 
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ReturnCode {
     Success,
     SuccessWithInfo,
@@ -97,6 +98,7 @@ const OCI_HTYPE_SPOOL: c_uint = 12;
 const OCI_HTYPE_TRANS: c_uint = 13;
 const OCI_HTYPE_COMPLEXOBJECT: c_uint = 14;
 
+#[derive(Debug)]
 pub enum HandleType {
     Env,
     Error,
@@ -157,53 +159,185 @@ impl From<c_uint> for HandleType {
     }
 }
 
-pub fn env_nls_create(envhpp: &*mut Env, mode: Mode) -> ReturnCode {
-    let null_ptr = ptr::null();
-    unsafe {
-        OCIEnvNlsCreate(
-            &envhpp,
-            mode.into(),
-            null_ptr,
-            null_ptr,
-            null_ptr,
-            null_ptr,
-            0,
-            null_ptr,
-            0,
-            0,
-        ).into()
+#[repr(C)]
+struct Handle { _private: [u8; 0] }
+
+#[derive(Debug)]
+pub struct Env { _handle: *mut Handle }
+
+impl Env {
+    pub fn new(mode: Mode) -> Result<Env, ReturnCode> {
+        let handle: *mut Handle = ptr::null_mut();
+        let null_ptr = ptr::null();
+
+        let result: ReturnCode = unsafe {
+            OCIEnvNlsCreate(
+                &handle,
+                mode.into(),
+                null_ptr,
+                null_ptr,
+                null_ptr,
+                null_ptr,
+                0,
+                null_ptr,
+                0,
+                0,
+            ).into()
+        };
+
+        match result {
+            ReturnCode::Success => Ok(Env { _handle: handle }),
+            _ => Err(result),
+        }
     }
 }
 
-pub fn error_get(
-    hndlp: *mut c_void,
-    recordno: c_uint,
-    errcodep: *mut c_int,
-    message: &mut CString,
-    hnd_type: HandleType,
-) -> ReturnCode {
-    let sql_state: *mut c_uchar = ptr::null_mut();
-    unsafe {
+impl Drop for Env {
+    fn drop(&mut self) {
+        handle_free(self._handle, HandleType::Env)
+    }
+}
+
+#[derive(Debug)]
+pub struct Error { _handle: *mut Handle }
+
+impl Error {
+    pub fn new(env: &Env) -> Result<Error, ReturnCode> {
+        handle_alloc(&env, HandleType::Error)
+            .map(|x| Error { _handle: x })
+    }
+}
+
+impl Drop for Error {
+    fn drop(&mut self) {
+        handle_free(self._handle, HandleType::Error)
+    }
+}
+
+#[derive(Debug)]
+pub struct CPool { _handle: *mut Handle }
+
+impl CPool {
+    pub fn new(env: &Env) -> Result<CPool, ReturnCode> {
+        handle_alloc(&env, HandleType::CPool)
+            .map(|x| CPool { _handle: x })
+    }
+}
+
+impl Drop for CPool {
+    fn drop(&mut self) {
+        handle_free(self._handle, HandleType::CPool)
+    }
+}
+
+fn handle_free(handle: *mut Handle, handle_type: HandleType) {
+    let result: ReturnCode = unsafe {
+        OCIHandleFree(handle as *mut c_void, handle_type.into()).into()
+    };
+
+    match result {
+        ReturnCode::Success => (),
+        _ => error!("unable to close handle: {:?}", result)
+    }
+}
+
+fn handle_alloc(env: &Env, handle_type: HandleType) -> Result<*mut Handle, ReturnCode> {
+    let handle: *mut c_void = ptr::null_mut();
+
+    let result = unsafe {
+        OCIHandleAlloc(
+            env._handle as *const c_void,
+            &handle,
+            handle_type.into(),
+            0,
+            ptr::null(),
+        ).into()
+    };
+
+    match result {
+        ReturnCode::Success => Ok(handle as *mut Handle),
+        _ => Err(result),
+    }
+}
+
+
+pub fn error_get(error: &Error, recordno: u32) -> Result<String, ReturnCode> {
+    let sql_state: *mut c_char = ptr::null_mut();
+    let mut messagep: *mut c_char = ptr::null_mut();
+    let mut errcodep: c_int = 0;
+
+    let result = unsafe {
         OCIErrorGet(
-            hndlp,
-            recordno,
+            error._handle as *mut c_void,
+            recordno as c_uint,
             sql_state,
-            errcodep,
-            message.as_mut_ptr(),
-            message.capacity() as c_uint,
-            hnd_type.into(),
+            &mut errcodep,
+            messagep,
+            3024 as c_uint,
+            HandleType::Error.into(),
         ).into()
+    };
+
+    match result {
+        ReturnCode::Success => {
+            let c_string = unsafe { CString::from_raw(messagep) };
+            Ok(c_string.into_string().unwrap())
+        },
+        _ => Err(result)
     }
 }
 
-pub fn handle_free(hndl: *mut c_void, typ: HandleType) -> ReturnCode {
-    unsafe { OCIHandleFree(hndl, typ.into()).into() }
+
+pub fn connection_pool_create(
+    env: &Env,
+    error: &Error,
+    cpool: &CPool,
+    dblink: &str,
+    conn_min: u32,
+    conn_max: u32,
+    conn_incr: u32,
+    pool_username: &str,
+    pool_password: &str,
+    mode: Mode,
+) -> Result<String, ReturnCode> {
+    let c_pool_name: *mut c_char = ptr::null_mut();
+    let c_pool_name_len: *mut c_uint = ptr::null_mut();
+    let c_dblink: CString = CString::new(dblink).expect("failed to convert dblink");
+    let c_pool_username: CString = CString::new(pool_username).expect("failed to convert username");
+    let c_pool_password: CString = CString::new(pool_password).expect("failed to convert password");
+
+    let result: ReturnCode = unsafe {
+        OCIConnectionPoolCreate(
+            env._handle,
+            error._handle,
+            cpool._handle,
+            &c_pool_name,
+            &c_pool_name_len,
+            c_dblink.as_ptr(),
+            dblink.len() as c_uint,
+            conn_min as c_uint,
+            conn_max as c_uint,
+            conn_incr as c_uint,
+            c_pool_username.as_ptr(),
+            pool_username.len() as c_uint,
+            c_pool_password.as_ptr(),
+            pool_password.len() as c_uint,
+            mode.into(),
+        ).into()
+    };
+
+    match result {
+        ReturnCode::Success => {
+            let c_string = unsafe { CString::from_raw(c_pool_name) };
+            Ok(c_string.into_string().unwrap())
+        },
+        _ => Err(result)
+    }
 }
 
-#[link(name = "clntsh")]
 extern "C" {
     fn OCIEnvNlsCreate(
-        envhpp: &*mut Env,
+        envhpp: &*mut Handle,
         mode: c_uint,
         ctxp: *const c_void,
         maloc_fp: *const c_void,
@@ -220,10 +354,36 @@ extern "C" {
     fn OCIErrorGet(
         hndlp: *mut c_void,
         recordno: c_uint,
-        sqlstate: *mut c_uchar,
+        sqlstate: *mut c_char,
         errcodep: *mut c_int,
-        bufp: *mut c_uchar,
+        bufp: *mut c_char,
         bufsiz: c_uint,
         hnd_type: c_uint,
+    ) -> c_int;
+
+    fn OCIHandleAlloc(
+        parenthp: *const c_void,
+        hndlpp: &*mut c_void,
+        hnd_type: c_uint,
+        xtramemsz: size_t,
+        usrmempp: *const c_void,
+    ) -> c_int;
+
+    fn OCIConnectionPoolCreate(
+        envhp: *mut Handle,
+        errhp: *mut Handle,
+        poolhp: *mut Handle,
+        pool_name: &*mut c_char,
+        pool_name_len: &*mut c_uint,
+        dblink: *const c_char,
+        dblink_len: c_uint,
+        conn_min: c_uint,
+        conn_max: c_uint,
+        conn_incr: c_uint,
+        pool_username: *const c_char,
+        pool_user_len: c_uint,
+        pool_password: *const c_char,
+        pool_pass_len: c_uint,
+        mode: c_uint,
     ) -> c_int;
 }
